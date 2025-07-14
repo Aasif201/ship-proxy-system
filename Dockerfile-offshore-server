@@ -1,0 +1,6 @@
+FROM openjdk:17-jdk-alpine
+WORKDIR /app
+COPY OffshoreProxyServer.java .
+RUN javac OffshoreProxyServer.java
+EXPOSE 9090
+ENTRYPOINT ["java", "OffshoreProxyServer"]

@@ -1,0 +1,6 @@
+FROM openjdk:17-jdk-alpine
+WORKDIR /app
+COPY ShipProxy.java .
+RUN javac ShipProxy.java
+EXPOSE 8080
+ENTRYPOINT ["java", "ShipProxy"]
