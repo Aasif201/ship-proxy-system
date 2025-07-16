@@ -22,13 +22,12 @@ public class OffshoreProxyServer {
                 break;
             }
             if ("HTTP".equals(type)) {
-                // Handle HTTP
                 int reqLen = in.readInt();
                 byte[] reqBytes = new byte[reqLen];
                 in.readFully(reqBytes);
 
-                // Parse HTTP request to get host and port
-                String reqStr = new String(reqBytes);
+                // Parse HTTP request to extract host/port
+                String reqStr = new String(reqBytes, "ISO-8859-1");
                 String host = null;
                 int port = 80;
                 for (String line : reqStr.split("\r\n")) {
@@ -52,16 +51,92 @@ public class OffshoreProxyServer {
                     destOut.write(reqBytes);
                     destOut.flush();
 
-                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     InputStream destIn = destSocket.getInputStream();
-                    byte[] buffer = new byte[4096];
-                    int read;
-                    while ((read = destIn.read(buffer)) != -1) {
-                        baos.write(buffer, 0, read);
-                        if (read < buffer.length) break;
-                    }
-                    byte[] respBytes = baos.toByteArray();
+                    ByteArrayOutputStream response = new ByteArrayOutputStream();
+                    byte[] headerBuf = new byte[8192];
+                    int headerLen = 0;
+                    boolean headerEnd = false;
 
+                    // Read headers
+                    while (!headerEnd) {
+                        int b = destIn.read();
+                        if (b == -1) break;
+                        headerBuf[headerLen++] = (byte)b;
+                        if (headerLen >= 4 &&
+                            headerBuf[headerLen-4] == '\r' &&
+                            headerBuf[headerLen-3] == '\n' &&
+                            headerBuf[headerLen-2] == '\r' &&
+                            headerBuf[headerLen-1] == '\n') {
+                            headerEnd = true;
+                        }
+                        if (headerLen == headerBuf.length) break; // very large or malformed headers!
+                    }
+                    response.write(headerBuf, 0, headerLen);
+
+                    String headerStr = new String(headerBuf, 0, headerLen, "ISO-8859-1");
+                    int contentLength = -1;
+                    boolean chunked = false;
+                    for (String line : headerStr.split("\r\n")) {
+                        if (line.toLowerCase().startsWith("content-length:")) {
+                            contentLength = Integer.parseInt(line.substring(15).trim());
+                        }
+                        if (line.toLowerCase().startsWith("transfer-encoding:") &&
+                            line.toLowerCase().contains("chunked")) {
+                            chunked = true;
+                        }
+                    }
+
+                    // Read body as per headers
+                    if (contentLength >= 0) {
+                        byte[] buf = new byte[4096];
+                        int read = 0;
+                        while (read < contentLength) {
+                            int n = destIn.read(buf, 0, Math.min(buf.length, contentLength-read));
+                            if (n == -1) break;
+                            response.write(buf, 0, n);
+                            read += n;
+                        }
+                    } else if (chunked) {
+                        ByteArrayOutputStream chunkedData = new ByteArrayOutputStream();
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(destIn, "ISO-8859-1"));
+                        while (true) {
+                            String chunkSizeLine = reader.readLine();
+                            if (chunkSizeLine == null) break;
+                            int chunkSize = Integer.parseInt(chunkSizeLine.trim(), 16);
+                            response.write((chunkSizeLine + "\r\n").getBytes("ISO-8859-1"));
+                            if (chunkSize == 0) {
+                                // End of chunks
+                                String trailer;
+                                // Read and forward trailing headers
+                                while ((trailer = reader.readLine()) != null && !trailer.isEmpty()) {
+                                    response.write((trailer + "\r\n").getBytes("ISO-8859-1"));
+                                }
+                                response.write("\r\n".getBytes("ISO-8859-1"));
+                                break;
+                            }
+                            int got = 0;
+                            while (got < chunkSize) {
+                                int needed = chunkSize - got;
+                                char[] buf = new char[needed];
+                                int n = reader.read(buf, 0, needed);
+                                if (n == -1) break;
+                                response.write(new String(buf, 0, n).getBytes("ISO-8859-1"));
+                                got += n;
+                            }
+                            // Read and write chunk ending \r\n
+                            String ending = reader.readLine();
+                            response.write((ending + "\r\n").getBytes("ISO-8859-1"));
+                        }
+                    } else {
+                        // Fallback: read until end of stream
+                        byte[] buf = new byte[4096];
+                        int n;
+                        while ((n = destIn.read(buf)) != -1) {
+                            response.write(buf, 0, n);
+                        }
+                    }
+
+                    byte[] respBytes = response.toByteArray();
                     out.writeInt(respBytes.length);
                     out.write(respBytes);
                     out.flush();
@@ -69,7 +144,6 @@ public class OffshoreProxyServer {
                     out.writeInt(0);
                 }
             } else if (type.startsWith("CONNECT")) {
-                // Handle HTTPS tunnel
                 String[] parts = type.split(" ");
                 String destHost = parts[1];
                 int destPort = Integer.parseInt(parts[2]);
@@ -77,45 +151,19 @@ public class OffshoreProxyServer {
                     Socket destSocket = new Socket(destHost, destPort);
                     out.writeUTF("OK");
                     out.flush();
-
                     tunnel(shipSocket, destSocket);
                 } catch (Exception e) {
                     out.writeUTF("FAIL");
                     out.flush();
-                    e.printStackTrace();
                 }
             }
         }
     }
 
-    // Tunnel method for HTTPS
     private void tunnel(Socket shipSocket, Socket destSocket) {
         try {
-            InputStream shipIn = shipSocket.getInputStream();
-            OutputStream shipOut = shipSocket.getOutputStream();
-            InputStream destIn = destSocket.getInputStream();
-            OutputStream destOut = destSocket.getOutputStream();
-
-            Thread t1 = new Thread(() -> {
-                try {
-                    byte[] buf = new byte[4096];
-                    int len;
-                    while ((len = shipIn.read(buf)) != -1) {
-                        destOut.write(buf, 0, len);
-                        destOut.flush();
-                    }
-                } catch (IOException ignored) {}
-            });
-            Thread t2 = new Thread(() -> {
-                try {
-                    byte[] buf = new byte[4096];
-                    int len;
-                    while ((len = destIn.read(buf)) != -1) {
-                        shipOut.write(buf, 0, len);
-                        shipOut.flush();
-                    }
-                } catch (IOException ignored) {}
-            });
+            Thread t1 = new Thread(() -> forward(shipSocket, destSocket));
+            Thread t2 = new Thread(() -> forward(destSocket, shipSocket));
             t1.start();
             t2.start();
             t1.join();
@@ -123,6 +171,20 @@ public class OffshoreProxyServer {
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private void forward(Socket inSocket, Socket outSocket) {
+        try (
+            InputStream in = inSocket.getInputStream();
+            OutputStream out = outSocket.getOutputStream()
+        ) {
+            byte[] buf = new byte[4096];
+            int len;
+            while ((len = in.read(buf)) != -1) {
+                out.write(buf, 0, len);
+                out.flush();
+            }
+        } catch (IOException ignored) {}
     }
 
     public static void main(String[] args) throws IOException {
